@@ -44,6 +44,8 @@ services:
     ports:
       - "3000:8080"
     environment:
+      WEBUI_NAME: "Ninth Dimension AI"
+      DEFAULT_INTERFACE_SETTINGS: '{"widescreenMode":true,"chatBubble":true}'
       OPENAI_API_BASE_URL: http://opea-openwebui-adapter:8000/v1
       OPENAI_API_KEY: EMPTY
       WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?Set WEBUI_SECRET_KEY in .env}
@@ -51,6 +53,13 @@ services:
       - open-webui-data:/app/backend/data
     restart: unless-stopped
 
+  portal:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ../portal:/usr/share/nginx/html:ro
+    restart: unless-stopped
 
   knowledge-manager:
     build:

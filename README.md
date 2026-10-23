@@ -36,12 +36,42 @@ The deployment script generates `WEBUI_SECRET_KEY` if missing.
 Set `HF_TOKEN` only if a model or download requires authentication.
 Never commit `.env`.
 
+## validate
+
+ docker compose \
+  --project-name private-rag \
+  --env-file "$PWD/.env" \
+  -f "$PWD/opea/compose.yaml" \
+  -f "$PWD/opea/compose.vllm.override.yaml" \
+  -f "$PWD/compose.app.yaml" \
+  config --quiet
+
+  
+## IF WEB_UI SOCKET KEY Error Occurs
+cd /opt/private-rag-deploy
+
+python3 - <<'PY'
+import secrets
+from pathlib import Path
+
+p = Path(".env")
+lines = p.read_text().splitlines() if p.exists() else []
+
+if not any(line.startswith("WEBUI_SECRET_KEY=") and line.split("=", 1)[1].strip()
+           for line in lines):
+    lines = [line for line in lines if not line.startswith("WEBUI_SECRET_KEY=")]
+    lines.append("WEBUI_SECRET_KEY=" + secrets.token_hex(32))
+    p.write_text("\n".join(lines) + "\n")
+
+p.chmod(0o600)
+print("WEBUI_SECRET_KEY is configured.")
+PY
+
+  
 ## Deploy
 
     ./deploy.sh
 
-## Ingest Knowledge files (PDF)
-    curl -X POST "http://127.0.0.1:6007/v1/dataprep/ingest" -F "files=@/root/handbook.pdf"
 
 The first startup downloads container images and model files and may take time.
 
@@ -50,6 +80,10 @@ Open the UI at:
     http://SERVER-IP:3000
 
 Restrict access to trusted users. For production, place the UI behind HTTPS and suitable authentication/network controls.
+
+## Ingest Knowledge files (PDF)
+    curl -X POST "http://127.0.0.1:6007/v1/dataprep/ingest" -F "files=@/root/handbook.pdf"
+
 
 ## Verify
 

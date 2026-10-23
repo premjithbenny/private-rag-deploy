@@ -51,6 +51,17 @@ services:
       - open-webui-data:/app/backend/data
     restart: unless-stopped
 
+
+  knowledge-manager:
+    build:
+      context: ../knowledge-ui
+    image: local/private-rag-knowledge-manager:1.0
+    environment:
+      DATAPREP_URL: http://dataprep-redis-service:5000
+    ports:
+      - "8098:8000"
+    restart: unless-stopped
+
 volumes:
   hf-cache:
   open-webui-data:

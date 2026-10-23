@@ -1,0 +1,260 @@
+import asyncio
+import ipaddress
+import json
+import os
+import socket
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse
+
+app = FastAPI(title="Private RAG Knowledge Sources")
+
+DATAPREP_URL = os.getenv(
+    "DATAPREP_URL", "http://dataprep-redis-service:5000"
+).rstrip("/")
+MAX_FILE_BYTES = 25 * 1024 * 1024
+MAX_FILES = 10
+
+# These extensions are offered by the UI. The installed OPEA parser
+# remains responsible for actually parsing each format.
+ALLOWED_EXTENSIONS = {
+    ".pdf", ".docx", ".doc", ".xlsx", ".xls",
+    ".csv", ".txt", ".md", ".html", ".htm", ".json",
+}
+
+PAGE = r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Knowledge Sources · Private RAG</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f5f7fb;color:#182230;font:15px system-ui,sans-serif}
+main{max-width:900px;margin:40px auto;padding:0 20px}
+h1{font-size:30px;margin-bottom:6px}
+.sub{color:#64748b;margin-top:0}
+.card{background:white;border:1px solid #e2e8f0;border-radius:14px;
+padding:24px;margin:22px 0;box-shadow:0 2px 8px #0f172a08}
+h2{font-size:19px;margin-top:0}
+input,textarea{width:100%;padding:12px;border:1px solid #cbd5e1;
+border-radius:8px;margin:10px 0;font:inherit}
+textarea{min-height:110px;resize:vertical}
+button{background:#1d4ed8;color:white;border:0;border-radius:8px;
+padding:11px 17px;font:inherit;font-weight:600;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}
+.note{font-size:13px;color:#64748b;line-height:1.6}
+#result{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;
+background:#eef2ff;border-radius:8px;display:none}
+</style>
+</head>
+<body><main>
+<h1>Knowledge Sources</h1>
+<p class="sub">Add documents and public web pages to your private AI knowledge base.</p>
+
+<section class="card">
+<h2>Upload documents</h2>
+<form id="upload">
+<input type="file" name="files" multiple required
+accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,.md,.html,.htm,.json">
+<p class="note">Maximum 10 files per batch, 25 MB per file.
+PDF, Word, Excel, CSV, TXT, Markdown, HTML and JSON.
+Actual parser support depends on the installed OPEA version.</p>
+<label><input type="checkbox" name="process_table" style="width:auto">
+Extract tables from PDFs (may take longer)</label>
+<p><button type="submit">Upload and index</button></p>
+</form>
+</section>
+
+<section class="card">
+<h2>Import website URLs</h2>
+<form id="urls">
+<label for="url-list">One public HTTP(S) URL per line</label>
+<textarea id="url-list" placeholder="https://example.com/handbook"></textarea>
+<p class="note">Start with public pages you are authorized to index.
+Use individual page URLs; crawling an entire website is not yet included.</p>
+<button type="submit">Import URLs</button>
+</form>
+</section>
+
+<section class="card">
+<h2>Ingestion result</h2>
+<div id="result" role="status" aria-live="polite"></div>
+</section>
+</main>
+<script>
+const result = document.querySelector("#result");
+async function submitForm(url, body) {
+  result.style.display = "block";
+  result.textContent = "Submitting to DataPrep...";
+  const buttons = document.querySelectorAll("button");
+  buttons.forEach(b => b.disabled = true);
+  try {
+    const r = await fetch(url, {method:"POST", body});
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = {detail:text}; }
+    result.textContent = r.ok
+      ? "Request accepted by DataPrep.\n" + JSON.stringify(data, null, 2)
+      : "Ingestion failed (HTTP " + r.status + ").\n" +
+        JSON.stringify(data, null, 2);
+  } catch (e) {
+    result.textContent = "Request failed: " + e.message;
+  } finally {
+    buttons.forEach(b => b.disabled = false);
+  }
+}
+document.querySelector("#upload").addEventListener("submit", async e => {
+  e.preventDefault();
+  const form = e.currentTarget;
+  const selected = form.querySelector('[type="file"]').files;
+  if (!selected.length) return;
+  const body = new FormData();
+  for (const file of selected) body.append("files", file);
+  body.append("process_table",
+    form.querySelector('[name="process_table"]').checked ? "true" : "false");
+  await submitForm("/api/upload", body);
+});
+document.querySelector("#urls").addEventListener("submit", async e => {
+  e.preventDefault();
+  const urls = document.querySelector("#url-list").value
+    .split(/\n/).map(s => s.trim()).filter(Boolean);
+  if (!urls.length) {
+    result.style.display = "block";
+    result.textContent = "Enter at least one URL.";
+    return;
+  }
+  await submitForm("/api/urls", new Blob([JSON.stringify({urls})],
+    {type:"application/json"}));
+});
+</script>
+</body></html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return PAGE
+
+
+@app.get("/health")
+async def health():
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{DATAPREP_URL}/v1/health_check")
+        return {"status": "ok" if r.is_success else "dataprep_unhealthy",
+                "dataprep_status": r.status_code}
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"DataPrep unavailable: {exc}") from exc
+
+
+async def send_to_dataprep(files=None, data=None):
+    try:
+        async with httpx.AsyncClient(timeout=600) as client:
+            response = await client.post(
+                f"{DATAPREP_URL}/v1/dataprep/ingest",
+                files=files,
+                data=data,
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Cannot reach DataPrep: {exc}") from exc
+
+    try:
+        result = response.json()
+    except ValueError:
+        result = {"detail": response.text[:2000]}
+
+    if response.is_error:
+        raise HTTPException(response.status_code, result)
+    return result
+
+
+@app.post("/api/upload")
+async def upload_files(
+    files: list[UploadFile] = File(...),
+    process_table: bool = Form(False),
+):
+    if not files or len(files) > MAX_FILES:
+        raise HTTPException(400, f"Upload between 1 and {MAX_FILES} files.")
+
+    payload = []
+    try:
+        for file in files:
+            name = (file.filename or "").replace("\\", "/").split("/")[-1]
+            ext = os.path.splitext(name)[1].lower()
+            if not name or ext not in ALLOWED_EXTENSIONS:
+                raise HTTPException(415, f"Unsupported file type: {name}")
+
+            content = await file.read(MAX_FILE_BYTES + 1)
+            if len(content) > MAX_FILE_BYTES:
+                raise HTTPException(413, f"{name} exceeds 25 MB.")
+            if not content:
+                raise HTTPException(400, f"{name} is empty.")
+
+            payload.append(
+                ("files", (name, content, file.content_type or
+                           "application/octet-stream"))
+            )
+
+        return await send_to_dataprep(
+            files=payload,
+            data={
+                "chunk_size": "1500",
+                "chunk_overlap": "100",
+                "process_table": str(process_table).lower(),
+                "table_strategy": "fast",
+            },
+        )
+    finally:
+        for file in files:
+            await file.close()
+
+
+def validate_public_url(value):
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise HTTPException(400, f"Invalid HTTP(S) URL: {value}")
+    if parsed.username or parsed.password:
+        raise HTTPException(400, "URLs containing credentials are not allowed.")
+    if parsed.port and parsed.port not in (80, 443):
+        raise HTTPException(400, "Only standard HTTP/HTTPS ports are allowed.")
+
+    host = parsed.hostname
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(
+            host, parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM
+        )}
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, f"Cannot resolve URL host: {host}") from exc
+
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if not ip.is_global:
+            raise HTTPException(
+                400, f"URLs resolving to non-public IP addresses are blocked: {host}"
+            )
+    return value
+
+
+@app.post("/api/urls")
+async def ingest_urls(payload: dict):
+    urls = payload.get("urls")
+    if not isinstance(urls, list) or not 1 <= len(urls) <= 10:
+        raise HTTPException(400, "Provide between 1 and 10 URLs.")
+
+    # Resolve/validate URLs concurrently to avoid blocking the event loop.
+    validated = []
+    for value in urls:
+        if not isinstance(value, str) or len(value) > 2048:
+            raise HTTPException(400, "Each URL must be a string under 2048 characters.")
+        validated.append(await asyncio.to_thread(validate_public_url, value))
+
+    return await send_to_dataprep(data={
+        "link_list": json.dumps(validated),
+        "chunk_size": "1500",
+        "chunk_overlap": "100",
+    })

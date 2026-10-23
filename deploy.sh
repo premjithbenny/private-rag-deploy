@@ -53,6 +53,36 @@ echo "Starting Private RAG services..."
 "${COMPOSE[@]}" up -d --build
 
 echo
-echo "Deployment started."
+echo "Waiting for vLLM API (model download/loading can take several minutes)..."
+ready=0
+for i in $(seq 1 180); do
+  if curl --fail --silent --show-error --max-time 5 \
+      http://127.0.0.1:8000/v1/models >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 10
+done
+
+if [ "$ready" -ne 1 ]; then
+  echo "ERROR: vLLM did not become ready within 30 minutes."
+  echo "Recent vLLM logs:"
+  docker logs --tail 100 private-rag-rag-llm-1 2>&1 || true
+  exit 1
+fi
+
+echo "vLLM API is responding."
+echo "Checking data-preparation health..."
+if ! curl --fail --silent --show-error --max-time 10 \
+    http://127.0.0.1:6007/v1/health_check; then
+  echo
+  echo "ERROR: Data-preparation health check failed."
+  "${COMPOSE[@]}" ps
+  exit 1
+fi
+
+echo
+echo "Initial readiness checks passed."
 echo "Open WebUI: http://<SERVER-IP>:3000"
 echo "Check status: ./status.sh"
+"${COMPOSE[@]}" ps

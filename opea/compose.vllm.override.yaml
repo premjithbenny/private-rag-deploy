@@ -1,0 +1,25 @@
+services:
+  tei-reranking-service:
+    image: ghcr.io/huggingface/text-embeddings-inference:1.9
+
+  tgi-service:
+    image: alpine:3.20
+    entrypoint: ["sh", "-c"]
+    command: ["sleep infinity"]
+
+  chaqna-backend-server:
+    environment:
+      LLM_SERVER_HOST_IP: http://rag-llm:8000
+      LLM_SERVER_PORT: "8000"
+      LLM_MODEL: Qwen/Qwen2.5-7B-Instruct
+      OPENAI_API_KEY: EMPTY
+
+  chaqna-ui-server:
+    profiles: ["optional-ui"]
+
+  chaqna-nginx-server:
+    profiles: ["optional-ui"]
+
+networks:
+  default:
+    driver: bridge

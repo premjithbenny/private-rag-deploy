@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+**/data/
+**/models/
+**/redis-backup/
+*.rdb
+*.log
+__pycache__/
+*.py[cod]
+.DS_Store

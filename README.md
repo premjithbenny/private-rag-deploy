@@ -40,6 +40,9 @@ Never commit `.env`.
 
     ./deploy.sh
 
+## Ingest Knowledge files (PDF)
+    curl -X POST "http://127.0.0.1:6007/v1/dataprep/ingest" -F "files=@/root/handbook.pdf"
+
 The first startup downloads container images and model files and may take time.
 
 Open the UI at:

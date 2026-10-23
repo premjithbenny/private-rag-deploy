@@ -25,7 +25,9 @@ Verify GPU access before deployment:
     docker run --rm --gpus all ubuntu nvidia-smi
 
 ## Configure
-
+cd /opt
+git clone https://github.com/premjithbenny/private-rag-deploy.git
+cd /opt/private-rag-deploy
 Copy `.env.example` to `.env` if it does not already exist:
 
     cp .env.example .env

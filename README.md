@@ -94,6 +94,24 @@ Do not regenerate the secret on every deployment. Changing it can invalidate exi
 
 Set `HF_TOKEN` only if your model or download configuration requires authentication.
 
+### Tavily API Key Configuration (Required for Web Search)
+
+The platform uses the Tavily API to provide internet search capabilities to the AI assistant.
+
+Add your Tavily API key to the `.env` file:
+
+```env
+TAVILY_API_KEY=your_tavily_api_key
+```
+
+Get your API key from:
+
+https://tavily.com/
+
+Replace `your_tavily_api_key` with your actual Tavily API key.
+
+Ensure that the relevant Open WebUI or web search integration container receives the `TAVILY_API_KEY` environment variable through the Docker Compose configuration.
+
 **Never commit `.env` or other files containing secrets to Git.**
 
 ## 3. Verify Required Files

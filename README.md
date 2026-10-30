@@ -16,6 +16,7 @@ A self-hosted private AI knowledge platform built with OPEA ChatQnA, vLLM, Redis
 | OpenAI-compatible adapter | Connects Open WebUI to OPEA ChatQnA | `127.0.0.1:8099` |
 | Knowledge Manager | Uploads documents and imports public URLs | Port `8098` |
 | Ninth Dimension portal | Landing page linking to the applications | Port `80` |
+| Tavily Web Search | Provides internet search capabilities for current information | External API |
 
 **Security:** Expose only the services users need. Keep Redis, DataPrep, embeddings, reranking, and backend APIs restricted to the server or a trusted network.
 
@@ -27,6 +28,7 @@ A self-hosted private AI knowledge platform built with OPEA ChatQnA, vLLM, Redis
 - Git, Python 3, and `curl`
 - Sufficient disk space for container images and model weights
 - Network access to download the required images and models
+- Tavily API key for web search functionality
 - Firewall rules configured for the intended application access
 
 Verify the prerequisites:
@@ -50,9 +52,9 @@ Create a working directory and clone the project:
 mkdir -p "$HOME/projects"
 cd "$HOME/projects"
 
-git clone https://github.com/Athul675/private-ai-knowledge-platform.git
+git clone https://github.com/premjithbenny/private-rag-deploy.git
 
-cd private-ai-knowledge-platform
+cd private-rag-deploy
 ```
 
 If you already have a checkout, navigate to that repository instead.
@@ -61,9 +63,7 @@ If you already have a checkout, navigate to that repository instead.
 
 The deployment script automatically creates `.env` from `.env.example` if `.env` does not exist. It also generates a persistent `WEBUI_SECRET_KEY` if one is missing or empty.
 
-**You do not need to run a separate Python script to generate the secret.**
-
-If you need to configure optional settings, such as `HF_TOKEN` for authenticated model downloads, create the environment file before deployment:
+If you need to configure optional settings, create the environment file before deployment:
 
 ```bash
 cp .env.example .env
@@ -71,15 +71,47 @@ chmod 600 .env
 nano .env
 ```
 
-Edit only the settings you need. Save the file and exit the editor.
+Configure the required and optional environment variables.
 
-If `.env` already exists, do not overwrite it with the example. The deployment script preserves the existing configuration and restricts the file permissions.
+### Tavily API Key — Required for Web Search
+
+The platform uses Tavily to provide internet search capabilities to the AI assistant.
+
+Add your Tavily API key to the `.env` file:
+
+```env
+TAVILY_API_KEY=your_tavily_api_key
+```
+
+Obtain an API key from:
+
+https://tavily.com/
+
+Replace `your_tavily_api_key` with your actual API key.
+
+**Important:**
+- A valid Tavily API key must be configured for web search to work.
+- Keep the API key private.
+- Never commit `.env` or API credentials to GitHub.
+- Ensure the application container receives the `TAVILY_API_KEY` environment variable.
+- If the key is changed, recreate or restart the relevant service so the updated environment variable is loaded.
+
+### Other Environment Settings
+
+You can also configure optional settings, such as `HF_TOKEN` for authenticated model downloads.
+
+```env
+HF_TOKEN=your_huggingface_token
+```
+
+The deployment script generates `WEBUI_SECRET_KEY` if no nonempty value is configured.
 
 Important:
 - Keep `.env` private.
 - Never commit `.env`, API tokens, passwords, or other secrets to Git.
 - Do not regenerate `WEBUI_SECRET_KEY` on every deployment. Changing it may invalidate existing sessions.
 - Set `HF_TOKEN` only when your model or download configuration requires authentication.
+- Do not overwrite an existing `.env` file with `.env.example` during routine deployments.
 
 ## 3. Deploy the Platform
 
@@ -99,6 +131,8 @@ The deployment script automatically:
 5. Builds local images where required and starts the services.
 6. Waits for the vLLM API and checks DataPrep health.
 7. Displays the final service status.
+
+Ensure that `TAVILY_API_KEY` is configured before deploying the web-search-enabled application.
 
 The first deployment may take time while Docker downloads images and vLLM loads the model.
 
@@ -124,7 +158,46 @@ For production use, prefer HTTPS and a reverse proxy instead of exposing applica
 
 The Knowledge Manager imports individual public HTTP(S) pages; it is not a full website crawler. Supported document formats depend on the installed OPEA DataPrep version.
 
-## 5. Verify the Deployment
+## 5. Enable Web Search in Open WebUI
+
+The platform supports internet search through Tavily, allowing the AI assistant to retrieve current information instead of relying exclusively on its locally hosted model.
+
+Web search must be enabled in Open WebUI's administration settings.
+
+### Configuration Steps
+
+1. Make sure `TAVILY_API_KEY` is configured in the `.env` file.
+2. Deploy or restart the application so the updated environment variables are available.
+3. Log in to Open WebUI using an administrator account.
+4. Open the **Admin Panel**.
+5. Navigate to the **Settings** section.
+6. Open the **Web Search** configuration.
+7. Enable Web Search.
+8. Select or configure Tavily as the search provider.
+9. Verify that the Tavily API key is configured and saved.
+10. Open the model configuration and enable Web Search for the RAG model.
+
+### Using Web Search
+
+Once enabled, users can use the RAG model in Open WebUI to ask questions requiring current internet information.
+
+Example questions:
+
+- What are the latest NVIDIA GPU announcements?
+- What are the current AI infrastructure trends?
+- Find the latest developments in Kubernetes.
+- What are the latest government tenders related to AI infrastructure?
+
+The assistant can use web search to retrieve current information and incorporate the results into its responses.
+
+**Important:**
+- Web Search must be enabled in the Open WebUI Admin Panel.
+- Web Search must also be enabled for the RAG model being used.
+- A valid Tavily API key is required.
+- The server must have outbound internet connectivity.
+- Local RAG document retrieval and internet web search are separate capabilities. Web Search does not replace the existing document ingestion and vector retrieval pipeline.
+
+## 6. Verify the Deployment
 
 ### Check service status
 
@@ -184,9 +257,25 @@ echo
 
 The vLLM API is bound to localhost by default and should be tested from the server.
 
-Successful health checks confirm that individual services are responding. They do not, by themselves, prove that document retrieval and end-to-end RAG question answering work correctly.
+### Verify Web Search
 
-## 6. Ingest Knowledge Documents
+1. Open Open WebUI.
+2. Select the configured RAG model.
+3. Ask a question about a recent event or current information.
+4. Verify that the web search functionality is triggered and results are incorporated into the answer.
+
+If web search fails, check:
+
+- `TAVILY_API_KEY` is present in `.env`.
+- The application container receives the environment variable.
+- The Tavily API key is valid.
+- The server has outbound internet connectivity.
+- Web Search is enabled in the Open WebUI Admin Panel.
+- Web Search is enabled for the selected RAG model.
+
+Successful health checks confirm that individual services are responding. They do not, by themselves, prove that document retrieval, internet search, and end-to-end RAG question answering work correctly.
+
+## 7. Ingest Knowledge Documents
 
 ### Using the Document Ingester UI
 
@@ -211,7 +300,7 @@ Replace `/root/handbook.pdf` with the actual path to your document.
 
 DataPrep processes the document and indexes its content for retrieval. The exact API endpoint and supported formats depend on the deployed OPEA DataPrep version.
 
-## 7. Persistent Data
+## 8. Persistent Data
 
 The deployment uses Docker volumes to preserve application data. A fresh deployment does not automatically import documents, chat history, or model caches from another server.
 
@@ -233,7 +322,7 @@ Confirm the volume names and mount points in the Compose configuration before pe
 
 Back up persistent data regularly and test restoration procedures.
 
-## 8. Stop and Restart
+## 9. Stop and Restart
 
 Stop the platform:
 
@@ -274,6 +363,7 @@ Review `stop.sh` before production use to confirm that it preserves persistent v
 - Restrict public access to only the ports users need.
 - Do not expose Redis, DataPrep, embeddings, reranking, or backend APIs directly to the internet unless specifically required and secured.
 - Keep `.env` private and never commit secrets.
+- Keep the Tavily API key private.
 - Pin image versions or digests instead of relying on mutable tags such as `latest` or `main`.
 - Back up persistent volumes and test restoration.
 - Monitor GPU memory, disk space, container health, and model loading.

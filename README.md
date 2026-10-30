@@ -201,6 +201,44 @@ If your server IP or hostname changes, update the links in `portal/index.html`.
 
 The Knowledge Manager imports individual public HTTP(S) pages. It is not a full website crawler. File format support depends on the installed OPEA DataPrep version.
 
+####  Enable Web Search in Open WebUI
+
+1. Open Open WebUI:
+
+   `http://SERVER-IP:3000/`
+
+2. Log in using an administrator account.
+3. Navigate to **Admin Panel**.
+4. Open **Settings**.
+5. Navigate to **Web Search**.
+6. Enable Web Search.
+7. Select Tavily as the web search provider.
+8. Configure the Tavily API key if prompted.
+9. Save the configuration.
+
+####  Enable Web Search for the RAG Model
+
+1. Navigate to the model configuration in the Open WebUI Admin Panel.
+2. Select the RAG model.
+3. Enable the **Web Search** capability for the RAG model.
+4. Save the model configuration.
+
+**Important:** Web Search must be enabled for the RAG model so that users can access internet search functionality when chatting with that model.
+
+#### Test Web Search
+
+Open a chat using the configured RAG model and ask a question requiring current internet information.
+
+Example queries:
+
+- What are the latest developments in NVIDIA AI infrastructure?
+- What are the latest announcements in generative AI?
+- What are the current developments in Kubernetes?
+- What are the latest AI technology updates?
+
+The assistant should be able to use internet search results alongside the available knowledge base, depending on the query and configured retrieval workflow.
+
+
 ## 7. Verify the Deployment
 
 ### Check service status

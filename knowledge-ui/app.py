@@ -1,489 +1,363 @@
-import asyncio
-import ipaddress
-import json
-import os
-import socket
+import asyncio, ipaddress, json, os, re, socket, sqlite3, uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
 import httpx
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="Private RAG Knowledge Sources")
-
-DATAPREP_URL = os.getenv(
-    "DATAPREP_URL", "http://dataprep-redis-service:5000"
-).rstrip("/")
+DATAPREP_URL = os.getenv("DATAPREP_URL", "http://dataprep-redis-service:5000").rstrip("/")
+INDEX_NAME = os.getenv("INDEX_NAME", "rag-redis")
+DB_PATH = os.getenv("SOURCES_DB_PATH", "/data/knowledge_sources.db")
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_FILES = 10
+MAX_DB_ROWS = int(os.getenv("MAX_DB_ROWS", "5000"))
+MAX_DB_EXPORT_BYTES = int(os.getenv("MAX_DB_EXPORT_MB", "20")) * 1024 * 1024
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".txt", ".md", ".html", ".htm", ".json"}
+IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,127}$")
+fernet_key = os.getenv("SOURCE_ENCRYPTION_KEY", "").strip()
+if not fernet_key:
+    raise RuntimeError("SOURCE_ENCRYPTION_KEY is required. Generate a Fernet key and add it to .env.")
+try:
+    FERNET = Fernet(fernet_key.encode())
+except Exception as exc:
+    raise RuntimeError("SOURCE_ENCRYPTION_KEY is invalid. Generate a Fernet key and keep it stable across restarts.") from exc
 
-# These extensions are offered by the UI. The installed OPEA parser
-# remains responsible for actually parsing each format.
-ALLOWED_EXTENSIONS = {
-    ".pdf", ".docx", ".doc", ".xlsx", ".xls",
-    ".csv", ".txt", ".md", ".html", ".htm", ".json",
-}
+sync_locks: dict[str, asyncio.Lock] = {}
+scheduler_task: asyncio.Task | None = None
 
-PAGE = r"""
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#082f75">
-<title>Knowledge Manager | Ninth Dimension</title>
-<style>
-:root {
-  --navy:#082f75; --blue:#0756c9; --blue-light:#eaf2ff;
-  --orange:#f28c18; --orange-hover:#dc7610;
-  --ink:#172b4d; --muted:#64748b; --line:#e2e8f0;
-  --surface:#fff; --canvas:#f4f7fc; --green:#16794b;
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--canvas);color:var(--ink);
-  font:15px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
-button,input,textarea{font:inherit}
-.topbar{background:linear-gradient(105deg,#073b91,var(--navy) 65%,#0756a8);
-  color:white;box-shadow:0 4px 18px #082f7524}
-.top-inner{max-width:1180px;margin:auto;padding:18px 26px;
-  display:flex;align-items:center;justify-content:space-between;gap:18px}
-.brand{display:flex;align-items:center;gap:12px;min-width:0}
-.brand-mark{width:43px;height:43px;border-radius:10px;background:var(--orange);
-  display:grid;place-items:center;flex-shrink:0}
-.brand-mark svg{width:26px;height:26px}
-.brand-name{font-size:18px;font-weight:750;letter-spacing:.1px;line-height:1.3}
-.brand-sub{font-size:10px;letter-spacing:1.6px;color:#d8e6ff;font-weight:650}
-.top-status{display:flex;align-items:center;gap:8px;color:#e1edff;font-size:12px}
-.dot{width:8px;height:8px;background:#5ee0a0;border-radius:50%;
-  box-shadow:0 0 0 4px #5ee0a022}
-main{max-width:1080px;margin:0 auto;padding:38px 24px 56px}
-.eyebrow{font-size:11px;font-weight:800;letter-spacing:2px;color:var(--blue);
-  text-transform:uppercase;margin-bottom:8px}
-h1{font-size:clamp(28px,4vw,37px);line-height:1.17;letter-spacing:-1px;
-  margin:0 0 12px;color:var(--ink)}
-.intro{color:var(--muted);font-size:15px;max-width:660px;margin:0}
-.hero{display:flex;justify-content:space-between;align-items:center;gap:24px;
-  margin-bottom:28px}
-.hero-icon{width:76px;height:76px;border-radius:22px;display:grid;place-items:center;
-  background:linear-gradient(145deg,#eaf2ff,#fff);border:1px solid #dce8fb;
-  flex-shrink:0}
-.hero-icon svg{width:40px;height:40px;color:var(--blue)}
-.section-label{font-size:11px;letter-spacing:1.5px;font-weight:800;
-  color:var(--muted);text-transform:uppercase;margin:0 0 13px}
-.cards{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:stretch}
-.card{background:var(--surface);border:1px solid var(--line);border-radius:17px;
-  padding:25px;box-shadow:0 5px 22px #17365d08;min-width:0}
-.card-head{display:flex;gap:13px;align-items:center;margin-bottom:8px}
-.icon-box{width:45px;height:45px;border-radius:12px;display:grid;place-items:center;
-  flex-shrink:0}
-.icon-box svg{width:23px;height:23px}
-.icon-blue{background:var(--blue-light);color:var(--blue)}
-.icon-orange{background:#fff1df;color:var(--orange-hover)}
-h2{font-size:19px;letter-spacing:-.3px;margin:0;font-weight:750}
-.desc{font-size:13px;color:var(--muted);margin:0 0 22px}
-.dropzone{position:relative;border:1.5px dashed #b7c9e5;border-radius:13px;
-  padding:26px 15px;text-align:center;background:#f9fbff;
-  transition:border-color .2s,background .2s}
-.dropzone.drag{border-color:var(--orange);background:#fff8ee}
-.dropzone input[type=file]{position:absolute;inset:0;width:100%;height:100%;
-  opacity:0;cursor:pointer}
-.upload-symbol{margin:0 auto 10px;width:48px;height:48px;border-radius:14px;
-  background:#eaf2ff;color:var(--blue);display:grid;place-items:center}
-.upload-symbol svg{width:25px;height:25px}
-.drop-title{font-size:14px;font-weight:700;margin-bottom:3px}
-.drop-hint{font-size:12px;color:var(--muted)}
-.file-list{font-size:12px;color:var(--blue);margin-top:10px;
-  overflow-wrap:anywhere;white-space:pre-line}
-.field-label{display:block;font-size:13px;font-weight:700;margin-bottom:8px}
-textarea{display:block;width:100%;min-height:155px;resize:vertical;padding:13px 14px;
-  border:1px solid #d5deeb;border-radius:10px;background:#fcfdff;color:var(--ink);
-  outline:none;transition:border-color .2s,box-shadow .2s}
-textarea:focus,input:focus-visible,button:focus-visible{
-  outline:3px solid #0756c926;outline-offset:2px}
-textarea:focus{border-color:var(--blue);box-shadow:0 0 0 3px #0756c914}
-textarea::placeholder{color:#9aa9bd}
-.hint{font-size:12px;color:var(--muted);margin:10px 0 0;line-height:1.6}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:9px;
-  border:0;border-radius:9px;padding:12px 17px;font-size:13px;font-weight:750;
-  cursor:pointer;transition:background .2s,transform .2s}
-.btn-primary{background:var(--orange);color:#fff;box-shadow:0 3px 9px #f28c182b}
-.btn-primary:hover{background:var(--orange-hover);transform:translateY(-1px)}
-.btn-secondary{background:#edf3ff;color:var(--blue)}
-.btn-secondary:hover{background:#dce9ff}
-.btn:disabled{opacity:.6;cursor:wait;transform:none}
-.action-row{display:flex;align-items:center;justify-content:space-between;
-  gap:12px;flex-wrap:wrap;margin-top:19px}
-.checkrow{display:flex;align-items:flex-start;gap:9px;color:#475569;font-size:12px}
-.checkrow input{accent-color:var(--blue);margin-top:3px}
-.file-meta{font-size:12px;color:var(--muted);margin-top:14px}
-.result-card{margin-top:22px}
-.result-head{display:flex;align-items:center;gap:12px;margin-bottom:14px}
-.result-head h2{font-size:17px}
-.result-icon{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;
-  background:#edf3ff;color:var(--blue)}
-#result{display:none;white-space:pre-wrap;overflow-wrap:anywhere;
-  padding:15px;border-radius:10px;font-size:13px;line-height:1.65;
-  max-height:360px;overflow:auto;background:#f1f5f9;color:#334155}
-#result.success{display:block;background:#edfaf2;color:#166534;border:1px solid #c6efd4}
-#result.error{display:block;background:#fff1f0;color:#9f2922;border:1px solid #ffd6d2}
-#result.loading{display:block;background:#eef4ff;color:#17468b;border:1px solid #d5e4ff}
-.footer{margin-top:30px;padding-top:20px;border-top:1px solid #e1e7f0;
-  display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;
-  color:#8290a5;font-size:11px}
-.footer strong{color:var(--blue);font-weight:750}
-@media(max-width:700px){
-  .top-inner{padding:15px 18px}.top-status{font-size:0}.top-status .dot{font-size:initial}
-  main{padding:28px 16px 38px}.hero{align-items:flex-start}.hero-icon{width:54px;height:54px;
-    border-radius:15px}.hero-icon svg{width:29px;height:29px}
-  .cards{grid-template-columns:1fr;gap:15px}.card{padding:20px}
-  .brand-name{font-size:16px}.brand-sub{font-size:9px;letter-spacing:1px}
-}
-@media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
-</style>
-</head>
-<body>
-<header class="topbar">
-  <div class="top-inner">
-    <div class="brand">
-      <div class="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"
-          stroke-linecap="round" stroke-linejoin="round">
-          <path d="M4 19V5l8-2 8 2v14l-8 2-8-2Z"/>
-          <path d="M12 3v18M4 5l8 2 8-2M4 19l8-2 8 2"/>
-        </svg>
-      </div>
-      <div>
-        <div class="brand-name">Ninth Dimension</div>
-        <div class="brand-sub">PRIVATE AI KNOWLEDGE PLATFORM</div>
-      </div>
-    </div>
-    <div class="top-status"><span class="dot"></span> Private knowledge workspace</div>
-  </div>
-</header>
 
-<main>
-  <section class="hero">
-    <div>
-      <div class="eyebrow">AI Knowledge Infrastructure</div>
-      <h1>Knowledge Manager</h1>
-      <p class="intro">Bring your company's knowledge into one private AI workspace.
-      Upload documents or import public web pages to make information searchable by your AI assistant.</p>
-    </div>
-    <div class="hero-icon" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
-        stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 3 4.5 7v5c0 4.4 3.2 7.4 7.5 9 4.3-1.6 7.5-4.6 7.5-9V7L12 3Z"/>
-        <path d="m9 12 2 2 4-4"/>
-      </svg>
-    </div>
-  </section>
+def now_iso(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def db_conn():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    return con
 
-  <div class="section-label">Add to your knowledge base</div>
-  <div class="cards">
-    <section class="card">
-      <div class="card-head">
-        <div class="icon-box icon-blue" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-            stroke-linecap="round" stroke-linejoin="round">
-            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/>
-            <path d="M14 2v6h6M8 13h8M8 17h8"/>
-          </svg>
-        </div>
-        <h2>Upload documents</h2>
-      </div>
-      <p class="desc">Add internal documents, reports, manuals and reference files.</p>
-      <form id="upload">
-        <div class="dropzone" id="dropzone">
-          <input id="file-input" type="file" name="files" multiple required
-            accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,.md,.html,.htm,.json"
-            aria-label="Choose documents to upload">
-          <div class="upload-symbol" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-              stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 16V4m-4 4 4-4 4 4"/>
-              <path d="M20 16.5v3a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 19.5v-3"/>
-            </svg>
-          </div>
-          <div class="drop-title">Drop files here or choose files</div>
-          <div class="drop-hint">Up to 10 files · 25 MB per file</div>
-          <div class="file-list" id="file-list" aria-live="polite"></div>
-        </div>
-        <p class="file-meta">PDF, Word, Excel, CSV, TXT, Markdown, HTML and JSON.
-          Parser support depends on your installed OPEA version.</p>
-        <div class="action-row">
-          <label class="checkrow">
-            <input type="checkbox" name="process_table">
-            <span>Extract PDF tables<br><span style="color:#8290a5">May take longer</span></span>
-          </label>
-          <button class="btn btn-primary" type="submit">
-            Upload and index <span aria-hidden="true">→</span>
-          </button>
-        </div>
-      </form>
-    </section>
+def init_db():
+    with db_conn() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS sources (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, db_type TEXT NOT NULL,
+            host TEXT NOT NULL, port INTEGER NOT NULL, database_name TEXT NOT NULL,
+            username TEXT NOT NULL, password_enc TEXT NOT NULL, object_name TEXT NOT NULL,
+            primary_key TEXT, tls INTEGER NOT NULL DEFAULT 1, interval_minutes INTEGER NOT NULL DEFAULT 60,
+            enabled INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'pending',
+            last_sync TEXT, next_sync TEXT, last_error TEXT, records_count INTEGER NOT NULL DEFAULT 0,
+            current_file TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
 
-    <section class="card">
-      <div class="card-head">
-        <div class="icon-box icon-orange" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-            stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="10"/>
-            <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10Z"/>
-          </svg>
-        </div>
-        <h2>Import website URLs</h2>
-      </div>
-      <p class="desc">Add public web pages containing useful company or product information.</p>
-      <form id="urls">
-        <label class="field-label" for="url-list">Website page URLs</label>
-        <textarea id="url-list" placeholder="https://example.com/handbook&#10;https://example.com/policies"></textarea>
-        <p class="hint">Enter one public HTTP(S) URL per line, up to 10 URLs per request.
-          Use pages you are authorized to index. Whole-site crawling is not included.</p>
-        <div class="action-row">
-          <span class="hint" style="margin:0">Public pages only</span>
-          <button class="btn btn-primary" type="submit">
-            Import web pages <span aria-hidden="true">→</span>
-          </button>
-        </div>
-      </form>
-    </section>
-  </div>
+def source_public(row):
+    d = dict(row)
+    d.pop("password_enc", None)
+    d["tls"] = bool(d["tls"]); d["enabled"] = bool(d["enabled"])
+    return d
 
-  <section class="card result-card">
-    <div class="result-head">
-      <div class="result-icon" aria-hidden="true">
-        <svg viewBox="0 0 24 24" width="21" height="21" fill="none"
-          stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M9 11 12 14 22 4"/>
-          <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
-        </svg>
-      </div>
-      <div>
-        <h2>Ingestion status</h2>
-        <div class="hint" style="margin:2px 0 0">Feedback returned by the knowledge ingestion service</div>
-      </div>
-    </div>
-    <div id="result" role="status" aria-live="polite"></div>
-  </section>
+def get_source(source_id):
+    with db_conn() as con: row = con.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
+    if not row: raise HTTPException(404, "Source not found.")
+    return dict(row)
 
-  <footer class="footer">
-    <span><strong>Ninth Dimension</strong> · Private AI Knowledge Platform</span>
-    <span>Documents remain in your configured private RAG infrastructure</span>
-  </footer>
-</main>
+def validate_ident(value, label):
+    if not value or not IDENT.fullmatch(value):
+        raise HTTPException(400, f"{label} must start with a letter/underscore and contain only letters, numbers, underscore or $.")
+    return value
 
+def quote_ident(value, db_type):
+    validate_ident(value, "Table/collection/column name")
+    return f'`{value}`' if db_type == "mysql" else f'"{value}"'
+
+def safe_value(v):
+    if v is None or isinstance(v, (str, int, float, bool)): return v
+    if hasattr(v, "isoformat"): return v.isoformat()
+    if isinstance(v, bytes): return v.decode("utf-8", "replace")
+    if isinstance(v, dict): return {str(k): safe_value(val) for k, val in v.items()}
+    if isinstance(v, (list, tuple)): return [safe_value(x) for x in v]
+    try: return str(v)
+    except Exception: return repr(v)
+
+def fetch_rows(source):
+    typ, host, port = source["db_type"], source["host"], int(source["port"])
+    database, username = source["database_name"], source["username"]
+    password = FERNET.decrypt(source["password_enc"].encode()).decode()
+    obj = validate_ident(source["object_name"], "Table/collection name")
+    tls = bool(source["tls"])
+    if typ == "postgres":
+        import psycopg
+        from psycopg import sql
+        conn = psycopg.connect(host=host, port=port, dbname=database, user=username, password=password,
+                               connect_timeout=10, sslmode="require" if tls else "prefer", options="-c statement_timeout=60000")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL("SELECT * FROM {} LIMIT %s").format(sql.Identifier(obj)), (MAX_DB_ROWS + 1,))
+                cols = [d.name for d in cur.description]
+                rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        finally: conn.close()
+    elif typ == "mysql":
+        import pymysql
+        conn = pymysql.connect(host=host, port=port, database=database, user=username, password=password,
+                               connect_timeout=10, read_timeout=60, write_timeout=10,
+                               ssl={"check_hostname": True} if tls else None, cursorclass=pymysql.cursors.DictCursor,
+                               charset="utf8mb4")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT * FROM {quote_ident(obj, 'mysql')} LIMIT %s", (MAX_DB_ROWS + 1,))
+                rows = list(cur.fetchall())
+        finally: conn.close()
+    elif typ == "mongodb":
+        from pymongo import MongoClient
+        uri = f"mongodb://{__import__('urllib.parse', fromlist=['quote_plus']).quote_plus(username)}:{__import__('urllib.parse', fromlist=['quote_plus']).quote_plus(password)}@{host}:{port}/{database}?authSource={database}&connectTimeoutMS=10000&serverSelectionTimeoutMS=10000"
+        client = MongoClient(uri, tls=tls, tlsAllowInvalidCertificates=False, appname="PrivateRAGKnowledgeManager")
+        try:
+            client.admin.command("ping")
+            rows = list(client[database][obj].find({}, limit=MAX_DB_ROWS + 1))
+        finally: client.close()
+        rows = [{k: safe_value(v) for k, v in row.items()} for row in rows]
+    else: raise HTTPException(400, "Unsupported database type.")
+    if len(rows) > MAX_DB_ROWS:
+        raise HTTPException(413, f"Source returned more than {MAX_DB_ROWS} records. Reduce the table/collection size before syncing.")
+    return rows
+
+def test_connection(source):
+    rows = fetch_rows(source)
+    return len(rows)
+
+async def dataprep_request(method, path, **kwargs):
+    try:
+        async with httpx.AsyncClient(timeout=600) as client:
+            r = await client.request(method, f"{DATAPREP_URL}{path}", **kwargs)
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"DataPrep unavailable: {type(exc).__name__}") from exc
+    try: data = r.json()
+    except ValueError: data = {"detail": r.text[:1500]}
+    if r.is_error: raise HTTPException(r.status_code, data)
+    return data
+
+async def send_to_dataprep(files=None, data=None):
+    return await dataprep_request("POST", "/v1/dataprep/ingest", files=files, data=data)
+
+async def delete_dataprep_file(filename):
+    # DataPrep's delete API expects file_path and index_name as embedded JSON fields.
+    try:
+        await dataprep_request("POST", "/v1/dataprep/delete", json={"file_path": filename, "index_name": INDEX_NAME})
+    except HTTPException as exc:
+        # A missing previous file is safe during cleanup; other errors are surfaced.
+        detail = str(exc.detail).lower()
+        if exc.status_code != 404 and "not found" not in detail and "does not exists" not in detail:
+            raise
+
+async def sync_source(source_id, force=False):
+    lock = sync_locks.setdefault(source_id, asyncio.Lock())
+    if lock.locked(): return {"status": "already_running", "source_id": source_id}
+    async with lock:
+        source = get_source(source_id)
+        if not source["enabled"] and not force:
+            return {"status": "paused", "source_id": source_id}
+        with db_conn() as con:
+            con.execute("UPDATE sources SET status='syncing',last_error=NULL,updated_at=? WHERE id=?", (now_iso(), source_id))
+        try:
+            rows = await asyncio.to_thread(fetch_rows, source)
+            run_id = uuid.uuid4().hex[:12]
+            filename = f"dbsource_{source_id}_{run_id}.json"
+            document = {
+                "source_name": source["name"], "database_type": source["db_type"],
+                "database": source["database_name"], "table_or_collection": source["object_name"],
+                "synced_at": now_iso(), "record_count": len(rows),
+                "records": rows,
+            }
+            content = json.dumps(document, ensure_ascii=False, default=safe_value, separators=(",", ":")).encode("utf-8")
+            if len(content) > MAX_DB_EXPORT_BYTES:
+                raise HTTPException(413, f"Export exceeds {MAX_DB_EXPORT_BYTES // (1024*1024)} MB. Reduce the selected table/collection size.")
+            result = await send_to_dataprep(
+                files=[("files", (filename, content, "application/json"))],
+                data={"chunk_size":"1500", "chunk_overlap":"100", "process_table":"false", "table_strategy":"fast", "index_name":INDEX_NAME},
+            )
+            old_file = source.get("current_file")
+            # Index the new export successfully before removing the previous version.
+            if old_file and old_file != filename:
+                await delete_dataprep_file(old_file)
+            next_sync = (datetime.now(timezone.utc) + timedelta(minutes=int(source["interval_minutes"]))).isoformat(timespec="seconds")
+            with db_conn() as con:
+                con.execute("UPDATE sources SET status='healthy',last_sync=?,next_sync=?,last_error=NULL,records_count=?,current_file=?,updated_at=? WHERE id=?",
+                            (now_iso(), next_sync, len(rows), filename, now_iso(), source_id))
+            return {"status":"ok", "source_id":source_id, "records_count":len(rows), "dataprep":result}
+        except Exception as exc:
+            message = exc.detail if isinstance(exc, HTTPException) else f"{type(exc).__name__}: {exc}"
+            message = str(message)[:1500]
+            with db_conn() as con:
+                con.execute("UPDATE sources SET status='error',last_error=?,next_sync=?,updated_at=? WHERE id=?",
+                            (message, (datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(timespec="seconds"), now_iso(), source_id))
+            raise
+
+async def scheduler_loop():
+    while True:
+        try:
+            with db_conn() as con:
+                rows = con.execute("SELECT id,next_sync FROM sources WHERE enabled=1").fetchall()
+            now = datetime.now(timezone.utc)
+            for row in rows:
+                due = True
+                if row["next_sync"]:
+                    try: due = datetime.fromisoformat(row["next_sync"]) <= now
+                    except ValueError: due = True
+                if due:
+                    try: await sync_source(row["id"])
+                    except Exception: pass
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+@asynccontextmanager
+async def lifespan(app):
+    global scheduler_task
+    init_db()
+    scheduler_task = asyncio.create_task(scheduler_loop())
+    try: yield
+    finally:
+        if scheduler_task:
+            scheduler_task.cancel()
+            try: await scheduler_task
+            except asyncio.CancelledError: pass
+
+app = FastAPI(title="Private RAG Knowledge Sources", lifespan=lifespan)
+
+PAGE = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Knowledge Manager | Ninth Dimension</title><style>
+:root{--navy:#082f75;--blue:#0756c9;--orange:#e47d16;--ink:#172b4d;--muted:#64748b;--line:#e2e8f0;--canvas:#f4f7fc}*{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif}header{background:linear-gradient(105deg,#073b91,var(--navy));color:white;padding:18px max(20px,calc((100% - 1100px)/2));font-weight:800}header small{display:block;font-size:10px;letter-spacing:1.6px;color:#d8e6ff}main{max-width:1100px;margin:auto;padding:32px 20px}.intro{color:var(--muted);max-width:760px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.card{background:white;border:1px solid var(--line);border-radius:15px;padding:22px;margin:18px 0;min-width:0}.card h2{margin:0 0 6px;font-size:19px}.desc,.hint{color:var(--muted);font-size:13px}.field{display:grid;gap:6px;margin:12px 0}.field label{font-size:13px;font-weight:700}.field input,.field select,.field textarea{width:100%;border:1px solid #ccd7e6;border-radius:8px;padding:10px;background:#fff;color:var(--ink);font:inherit}.fields3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}.btn{border:0;border-radius:8px;background:var(--orange);color:white;padding:11px 15px;font-weight:750;cursor:pointer}.btn.secondary{background:#eaf2ff;color:var(--blue)}.btn.danger{background:#fff0ef;color:#a52822}.btn:disabled{opacity:.6}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.status{font-size:12px;border-radius:99px;padding:4px 9px;background:#edf2f7;color:#475569}.status.healthy{background:#e7f8ed;color:#166534}.status.error{background:#fff0ef;color:#a52822}.status.syncing{background:#eaf2ff;color:#17468b}.source{border:1px solid var(--line);border-radius:11px;padding:15px;margin-top:12px;background:#fff}.source-top{display:flex;justify-content:space-between;gap:10px;align-items:start}.source p{margin:6px 0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}.actions .btn{font-size:12px;padding:8px 10px}#result{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;border-radius:8px;background:#f1f5f9;display:none;font-size:13px}#result.success{display:block;background:#edfaf2;color:#166534}#result.error{display:block;background:#fff1f0;color:#9f2922}#result.loading{display:block;background:#eef4ff;color:#17468b}.full{grid-column:1/-1}footer{color:#8290a5;font-size:11px;border-top:1px solid var(--line);padding-top:18px;margin-top:25px}@media(max-width:760px){.grid,.fields3{grid-template-columns:1fr}.full{grid-column:auto}main{padding:20px 13px}.card{padding:16px}}
+</style></head><body><header>Ninth Dimension <small>PRIVATE AI KNOWLEDGE PLATFORM</small></header><main><h1>Knowledge Manager</h1><p class="intro">Upload internal documents, import public website pages, or connect PostgreSQL, MySQL and MongoDB sources to your private RAG knowledge base. Database sources sync automatically every 60 minutes by default.</p>
+<div class="grid"><section class="card"><h2>Upload documents</h2><p class="desc">Existing document ingestion is preserved.</p><form id="upload"><div class="field"><label for="files">Files (up to 10; 25 MB each)</label><input id="files" type="file" multiple required accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,.md,.html,.htm,.json"></div><label><input id="process_table" type="checkbox"> Extract PDF tables</label><p><button class="btn">Upload and index</button></p></form></section>
+<section class="card"><h2>Import website URLs</h2><p class="desc">One public HTTP(S) URL per line, up to 10.</p><form id="urls"><div class="field"><label for="url_list">Website page URLs</label><textarea id="url_list" rows="5" placeholder="https://example.com/handbook" required></textarea></div><button class="btn">Import web pages</button></form></section>
+<section class="card full"><h2>Connect a database</h2><p class="desc">Use a read-only account and select one table or collection per source. Database sync exports up to the configured row/size limits to DataPrep.</p><form id="source-form"><div class="fields3"><div class="field"><label>Source name</label><input name="name" required maxlength="100" placeholder="CRM customers"></div><div class="field"><label>Database type</label><select name="db_type" id="db_type"><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option><option value="mongodb">MongoDB</option></select></div><div class="field"><label>Sync interval (minutes)</label><input name="interval_minutes" type="number" min="15" max="1440" value="60" required></div></div><div class="fields3"><div class="field"><label>Host</label><input name="host" required placeholder="db.internal.example"></div><div class="field"><label>Port</label><input name="port" type="number" required value="5432"></div><div class="field"><label>Database name</label><input name="database_name" required></div></div><div class="fields3"><div class="field"><label>Username</label><input name="username" required autocomplete="off"></div><div class="field"><label>Password</label><input name="password" type="password" required autocomplete="new-password"></div><div class="field"><label id="object-label">Table name</label><input name="object_name" required placeholder="customers"></div></div><div class="fields3"><div class="field"><label>Primary key (optional, informational)</label><input name="primary_key" placeholder="id"></div><div class="field"><label>TLS</label><select name="tls"><option value="true" selected>Require / enable TLS</option><option value="false">Disable TLS (trusted network only)</option></select></div><div class="field"><label>&nbsp;</label><button class="btn" type="submit">Test, save and sync</button></div></div><p class="hint">Password is encrypted before being stored by this application. The source is tested and its first sync starts immediately. MongoDB expects host, port, database, username, password and collection separately.</p></form></section>
+<section class="card full"><div class="row" style="justify-content:space-between"><div><h2>Connected database sources</h2><p class="desc">Last sync, schedule, row count and errors.</p></div><button class="btn secondary" id="refresh" type="button">Refresh status</button></div><div id="sources"><p class="hint">Loading sources…</p></div></section>
+<section class="card full"><h2>Ingestion status</h2><div id="result" role="status" aria-live="polite"></div></section></div><footer><b>Ninth Dimension</b> · Private AI Knowledge Platform · Database credentials never appear in source-list API responses.</footer></main>
 <script>
-const result = document.querySelector("#result");
-const buttons = document.querySelectorAll("button");
-const fileInput = document.querySelector("#file-input");
-const fileList = document.querySelector("#file-list");
-const dropzone = document.querySelector("#dropzone");
-
-function showResult(kind, message) {
-  result.className = kind;
-  result.style.display = "block";
-  result.textContent = message;
-}
-function displayFiles(files) {
-  const list = Array.from(files);
-  fileList.textContent = list.length
-    ? list.map(f => f.name + " · " + (f.size / 1024 / 1024).toFixed(2) + " MB").join("\n")
-    : "";
-}
-fileInput.addEventListener("change", () => displayFiles(fileInput.files));
-["dragenter", "dragover"].forEach(eventName => dropzone.addEventListener(eventName, e => {
-  e.preventDefault();
-  dropzone.classList.add("drag");
-}));
-["dragleave", "drop"].forEach(eventName => dropzone.addEventListener(eventName, e => {
-  e.preventDefault();
-  dropzone.classList.remove("drag");
-}));
-dropzone.addEventListener("drop", e => {
-  if (e.dataTransfer && e.dataTransfer.files.length) {
-    fileInput.files = e.dataTransfer.files;
-    displayFiles(fileInput.files);
-  }
-});
-
-async function submitForm(url, body) {
-  showResult("loading", "Processing your request…\nPlease wait while the documents or URLs are sent to DataPrep.");
-  buttons.forEach(b => b.disabled = true);
-  try {
-    const r = await fetch(url, {method:"POST", body});
-    const text = await r.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = {detail:text}; }
-    showResult(r.ok ? "success" : "error",
-      (r.ok ? "DataPrep response\n\n" : "Ingestion failed (HTTP " + r.status + ")\n\n") +
-      JSON.stringify(data, null, 2));
-  } catch (e) {
-    showResult("error", "Request failed: " + e.message);
-  } finally {
-    buttons.forEach(b => b.disabled = false);
-  }
-}
-document.querySelector("#upload").addEventListener("submit", async e => {
-  e.preventDefault();
-  const form = e.currentTarget;
-  const selected = fileInput.files;
-  if (!selected.length) return;
-  if (selected.length > 10) {
-    showResult("error", "Please select no more than 10 files per batch.");
-    return;
-  }
-  const tooLarge = Array.from(selected).find(f => f.size > 25 * 1024 * 1024);
-  if (tooLarge) {
-    showResult("error", tooLarge.name + " exceeds the 25 MB per-file limit.");
-    return;
-  }
-  const body = new FormData();
-  for (const file of selected) body.append("files", file);
-  body.append("process_table",
-    form.querySelector('[name="process_table"]').checked ? "true" : "false");
-  await submitForm("/api/upload", body);
-});
-document.querySelector("#urls").addEventListener("submit", async e => {
-  e.preventDefault();
-  const urls = document.querySelector("#url-list").value
-    .split(/\n/).map(s => s.trim()).filter(Boolean);
-  if (!urls.length) {
-    showResult("error", "Enter at least one URL.");
-    return;
-  }
-  if (urls.length > 10) {
-    showResult("error", "Please enter no more than 10 URLs per request.");
-    return;
-  }
-  await submitForm("/api/urls", new Blob([JSON.stringify({urls})],
-    {type:"application/json"}));
-});
-</script>
-</body>
-</html>
-"""
-
+const $=s=>document.querySelector(s), result=$('#result');
+function show(kind,msg){result.className=kind;result.textContent=msg;result.style.display='block'}
+async function req(url,opts={}){const r=await fetch(url,opts);let d;try{d=await r.json()}catch{d={detail:await r.text()}}if(!r.ok)throw Error(typeof d.detail==='string'?d.detail:JSON.stringify(d.detail||d));return d}
+async function action(url,method='POST'){try{show('loading','Working…');const d=await req(url,{method});show('success',JSON.stringify(d,null,2));await loadSources()}catch(e){show('error',e.message)}}
+$('#db_type').addEventListener('change',e=>{const p={postgres:5432,mysql:3306,mongodb:27017};$('input[name=port]').value=p[e.target.value];$('#object-label').textContent=e.target.value==='mongodb'?'Collection name':'Table name'});
+$('#upload').addEventListener('submit',async e=>{e.preventDefault();const fs=$('#files').files;if(!fs.length)return; if(fs.length>10)return show('error','Select no more than 10 files.');for(const f of fs)if(f.size>25*1024*1024)return show('error',f.name+' exceeds 25 MB.');const b=new FormData();for(const f of fs)b.append('files',f);b.append('process_table',$('#process_table').checked?'true':'false');try{show('loading','Uploading and indexing…');show('success',JSON.stringify(await req('/api/upload',{method:'POST',body:b}),null,2));}catch(e){show('error',e.message)}});
+$('#urls').addEventListener('submit',async e=>{e.preventDefault();const urls=$('#url_list').value.split(/\n/).map(x=>x.trim()).filter(Boolean);try{show('loading','Importing web pages…');show('success',JSON.stringify(await req('/api/urls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls})}),null,2));}catch(e){show('error',e.message)}});
+$('#source-form').addEventListener('submit',async e=>{e.preventDefault();const form=e.currentTarget;const b=Object.fromEntries(new FormData(form));b.port=Number(b.port);b.interval_minutes=Number(b.interval_minutes);b.tls=b.tls==='true';try{show('loading','Testing database connection, saving source and running first sync…');const d=await req('/api/sources',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});show('success',JSON.stringify(d,null,2));form.reset();$('#source-form [name=interval_minutes]').value=60;$('#db_type').dispatchEvent(new Event('change'));await loadSources()}catch(e){show('error',e.message)}});
+async function loadSources(){try{const d=await req('/api/sources');const root=$('#sources');if(!d.sources.length){root.innerHTML='<p class="hint">No database sources connected yet.</p>';return}root.innerHTML='';for(const s of d.sources){const el=document.createElement('div');el.className='source';const top=document.createElement('div');top.className='source-top';const left=document.createElement('div');const title=document.createElement('b');title.textContent=s.name+' · '+s.db_type.toUpperCase();const meta=document.createElement('p');meta.textContent=s.host+':'+s.port+' / '+s.database_name+' / '+s.object_name+' · '+s.records_count+' records';left.append(title,meta);const badge=document.createElement('span');badge.className='status '+(s.status==='healthy'?'healthy':s.status==='error'?'error':s.status==='syncing'?'syncing':'');badge.textContent=s.enabled?s.status:'paused';top.append(left,badge);el.append(top);const info=document.createElement('p');info.textContent='Interval: '+s.interval_minutes+' min · Last sync: '+(s.last_sync||'Never')+' · Next sync: '+(s.next_sync||'Not scheduled');el.append(info);if(s.last_error){const err=document.createElement('p');err.style.color='#a52822';err.textContent='Last error: '+s.last_error;el.append(err)}const acts=document.createElement('div');acts.className='actions';function btn(label,cls,fn){const b=document.createElement('button');b.className='btn '+cls;b.textContent=label;b.onclick=fn;acts.append(b)}btn('Sync now','',()=>action('/api/sources/'+s.id+'/sync'));btn(s.enabled?'Pause':'Resume','secondary',()=>action('/api/sources/'+s.id+'/'+(s.enabled?'pause':'resume')));btn('Delete source','danger',()=>{if(confirm('Delete source configuration and its indexed documents?'))action('/api/sources/'+s.id,'DELETE')});el.append(acts);root.append(el)}}catch(e){$('#sources').textContent='Could not load sources: '+e.message}}
+$('#refresh').addEventListener('click',loadSources);loadSources();setInterval(loadSources,30000);
+</script></body></html>'''
 
 @app.get("/", response_class=HTMLResponse)
-async def home():
-    return PAGE
-
+async def home(): return PAGE
 
 @app.get("/health")
 async def health():
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{DATAPREP_URL}/v1/health_check")
-        return {"status": "ok" if r.is_success else "dataprep_unhealthy",
-                "dataprep_status": r.status_code}
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"DataPrep unavailable: {exc}") from exc
-
-
-async def send_to_dataprep(files=None, data=None):
-    try:
-        async with httpx.AsyncClient(timeout=600) as client:
-            response = await client.post(
-                f"{DATAPREP_URL}/v1/dataprep/ingest",
-                files=files,
-                data=data,
-            )
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Cannot reach DataPrep: {exc}") from exc
-
-    try:
-        result = response.json()
-    except ValueError:
-        result = {"detail": response.text[:2000]}
-
-    if response.is_error:
-        raise HTTPException(response.status_code, result)
-    return result
-
+        async with httpx.AsyncClient(timeout=5) as client: r = await client.get(f"{DATAPREP_URL}/v1/health_check")
+        return {"status":"ok" if r.is_success else "dataprep_unhealthy", "dataprep_status":r.status_code}
+    except httpx.HTTPError as exc: raise HTTPException(502, f"DataPrep unavailable: {type(exc).__name__}") from exc
 
 @app.post("/api/upload")
-async def upload_files(
-    files: list[UploadFile] = File(...),
-    process_table: bool = Form(False),
-):
-    if not files or len(files) > MAX_FILES:
-        raise HTTPException(400, f"Upload between 1 and {MAX_FILES} files.")
-
-    payload = []
+async def upload_files(files: list[UploadFile] = File(...), process_table: bool = Form(False)):
+    if not files or len(files)>MAX_FILES: raise HTTPException(400, f"Upload between 1 and {MAX_FILES} files.")
+    payload=[]
     try:
         for file in files:
-            name = (file.filename or "").replace("\\", "/").split("/")[-1]
-            ext = os.path.splitext(name)[1].lower()
-            if not name or ext not in ALLOWED_EXTENSIONS:
-                raise HTTPException(415, f"Unsupported file type: {name}")
-
-            content = await file.read(MAX_FILE_BYTES + 1)
-            if len(content) > MAX_FILE_BYTES:
-                raise HTTPException(413, f"{name} exceeds 25 MB.")
-            if not content:
-                raise HTTPException(400, f"{name} is empty.")
-
-            payload.append(
-                ("files", (name, content, file.content_type or
-                           "application/octet-stream"))
-            )
-
-        return await send_to_dataprep(
-            files=payload,
-            data={
-                "chunk_size": "1500",
-                "chunk_overlap": "100",
-                "process_table": str(process_table).lower(),
-                "table_strategy": "fast",
-            },
-        )
+            name=(file.filename or "").replace("\\","/").split("/")[-1]; ext=os.path.splitext(name)[1].lower()
+            if not name or ext not in ALLOWED_EXTENSIONS: raise HTTPException(415, f"Unsupported file type: {name}")
+            content=await file.read(MAX_FILE_BYTES+1)
+            if len(content)>MAX_FILE_BYTES: raise HTTPException(413, f"{name} exceeds 25 MB.")
+            if not content: raise HTTPException(400, f"{name} is empty.")
+            payload.append(("files",(name,content,file.content_type or "application/octet-stream")))
+        return await send_to_dataprep(files=payload,data={"chunk_size":"1500","chunk_overlap":"100","process_table":str(process_table).lower(),"table_strategy":"fast","index_name":INDEX_NAME})
     finally:
-        for file in files:
-            await file.close()
-
+        for file in files: await file.close()
 
 def validate_public_url(value):
-    parsed = urlparse(value)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise HTTPException(400, f"Invalid HTTP(S) URL: {value}")
-    if parsed.username or parsed.password:
-        raise HTTPException(400, "URLs containing credentials are not allowed.")
-    if parsed.port and parsed.port not in (80, 443):
-        raise HTTPException(400, "Only standard HTTP/HTTPS ports are allowed.")
-
-    host = parsed.hostname
-    try:
-        addresses = {item[4][0] for item in socket.getaddrinfo(
-            host, parsed.port or (443 if parsed.scheme == "https" else 80),
-            type=socket.SOCK_STREAM
-        )}
-    except (OSError, ValueError) as exc:
-        raise HTTPException(400, f"Cannot resolve URL host: {host}") from exc
-
+    parsed=urlparse(value)
+    if parsed.scheme not in ("http","https") or not parsed.hostname: raise HTTPException(400,f"Invalid HTTP(S) URL: {value}")
+    if parsed.username or parsed.password: raise HTTPException(400,"URLs containing credentials are not allowed.")
+    if parsed.port and parsed.port not in (80,443): raise HTTPException(400,"Only standard HTTP/HTTPS ports are allowed.")
+    try: addresses={x[4][0] for x in socket.getaddrinfo(parsed.hostname,parsed.port or (443 if parsed.scheme=="https" else 80),type=socket.SOCK_STREAM)}
+    except (OSError,ValueError) as exc: raise HTTPException(400,f"Cannot resolve URL host: {parsed.hostname}") from exc
     for address in addresses:
-        ip = ipaddress.ip_address(address)
-        if not ip.is_global:
-            raise HTTPException(
-                400, f"URLs resolving to non-public IP addresses are blocked: {host}"
-            )
+        if not ipaddress.ip_address(address).is_global: raise HTTPException(400,f"URLs resolving to non-public IP addresses are blocked: {parsed.hostname}")
     return value
-
 
 @app.post("/api/urls")
 async def ingest_urls(payload: dict):
-    urls = payload.get("urls")
-    if not isinstance(urls, list) or not 1 <= len(urls) <= 10:
-        raise HTTPException(400, "Provide between 1 and 10 URLs.")
-
-    # Resolve/validate URLs concurrently to avoid blocking the event loop.
-    validated = []
+    urls=payload.get("urls")
+    if not isinstance(urls,list) or not 1<=len(urls)<=10: raise HTTPException(400,"Provide between 1 and 10 URLs.")
+    valid=[]
     for value in urls:
-        if not isinstance(value, str) or len(value) > 2048:
-            raise HTTPException(400, "Each URL must be a string under 2048 characters.")
-        validated.append(await asyncio.to_thread(validate_public_url, value))
+        if not isinstance(value,str) or len(value)>2048: raise HTTPException(400,"Each URL must be a string under 2048 characters.")
+        valid.append(await asyncio.to_thread(validate_public_url,value))
+    return await send_to_dataprep(data={"link_list":json.dumps(valid),"chunk_size":"1500","chunk_overlap":"100","index_name":INDEX_NAME})
 
-    return await send_to_dataprep(data={
-        "link_list": json.dumps(validated),
-        "chunk_size": "1500",
-        "chunk_overlap": "100",
-    })
+class SourceInput(BaseModel):
+    name: str = Field(min_length=1,max_length=100)
+    db_type: str
+    host: str = Field(min_length=1,max_length=253)
+    port: int = Field(ge=1,le=65535)
+    database_name: str = Field(min_length=1,max_length=128)
+    username: str = Field(min_length=1,max_length=128)
+    password: str = Field(min_length=1,max_length=2048)
+    object_name: str = Field(min_length=1,max_length=128)
+    primary_key: str | None = Field(default=None,max_length=128)
+    tls: bool = True
+    interval_minutes: int = Field(default=60,ge=15,le=1440)
+
+@app.get("/api/sources")
+async def list_sources():
+    with db_conn() as con: rows=con.execute("SELECT * FROM sources ORDER BY created_at DESC").fetchall()
+    return {"sources":[source_public(r) for r in rows]}
+
+@app.post("/api/sources")
+async def create_source(payload: SourceInput):
+    typ=payload.db_type.lower()
+    if typ not in ("postgres","mysql","mongodb"): raise HTTPException(400,"db_type must be postgres, mysql or mongodb.")
+    if not payload.host.strip() or any(ch in payload.host for ch in " /\\@\n\r"): raise HTTPException(400,"Enter a hostname or IP address, not a URL.")
+    obj=validate_ident(payload.object_name, "Table/collection name")
+    if payload.primary_key: validate_ident(payload.primary_key,"Primary key")
+    if typ=="postgres" and payload.port==5432: pass
+    source_id=uuid.uuid4().hex
+    source={"id":source_id,"name":payload.name.strip(),"db_type":typ,"host":payload.host.strip(),"port":payload.port,
+            "database_name":payload.database_name.strip(),"username":payload.username,"password_enc":FERNET.encrypt(payload.password.encode()).decode(),
+            "object_name":obj,"primary_key":payload.primary_key,"tls":int(payload.tls),"interval_minutes":payload.interval_minutes,"enabled":1,
+            "status":"pending","last_sync":None,"next_sync":None,"last_error":None,"records_count":0,"current_file":None,"created_at":now_iso(),"updated_at":now_iso()}
+    try: count=await asyncio.to_thread(test_connection,source)
+    except HTTPException: raise
+    except Exception as exc:
+        # Avoid returning exception strings that may contain connection details or credentials.
+        raise HTTPException(400,f"Database connection/test failed ({type(exc).__name__}). Check host, port, credentials, TLS and object name.") from exc
+    with db_conn() as con:
+        con.execute("""INSERT INTO sources(id,name,db_type,host,port,database_name,username,password_enc,object_name,primary_key,tls,interval_minutes,enabled,status,last_sync,next_sync,last_error,records_count,current_file,created_at,updated_at)
+        VALUES(:id,:name,:db_type,:host,:port,:database_name,:username,:password_enc,:object_name,:primary_key,:tls,:interval_minutes,:enabled,:status,:last_sync,:next_sync,:last_error,:records_count,:current_file,:created_at,:updated_at)""",source)
+    try: sync_result=await sync_source(source_id,force=True)
+    except Exception as exc:
+        return {"source":source_public(get_source(source_id)),"test_records":count,"sync":"failed","detail":str(exc.detail if isinstance(exc,HTTPException) else type(exc).__name__)}
+    return {"source":source_public(get_source(source_id)),"test_records":count,"sync":sync_result}
+
+@app.post("/api/sources/{source_id}/sync")
+async def sync_now(source_id: str):
+    get_source(source_id)
+    try: return await sync_source(source_id,force=True)
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(500,f"Sync failed ({type(exc).__name__}). See source status for details.") from exc
+
+@app.post("/api/sources/{source_id}/pause")
+async def pause_source(source_id: str):
+    get_source(source_id)
+    with db_conn() as con: con.execute("UPDATE sources SET enabled=0,status='paused',next_sync=NULL,updated_at=? WHERE id=?",(now_iso(),source_id))
+    return {"status":"paused","source_id":source_id}
+
+@app.post("/api/sources/{source_id}/resume")
+async def resume_source(source_id: str):
+    get_source(source_id)
+    with db_conn() as con: con.execute("UPDATE sources SET enabled=1,status='pending',next_sync=?,updated_at=? WHERE id=?",(now_iso(),now_iso(),source_id))
+    return {"status":"resumed","source_id":source_id}
+
+@app.delete("/api/sources/{source_id}")
+async def delete_source(source_id: str):
+    source=get_source(source_id)
+    if source.get("current_file"):
+        await delete_dataprep_file(source["current_file"])
+    with db_conn() as con: con.execute("DELETE FROM sources WHERE id=?",(source_id,))
+    return {"status":"deleted","source_id":source_id,"indexed_file_removed":bool(source.get("current_file"))}

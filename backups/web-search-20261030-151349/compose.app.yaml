@@ -1,0 +1,84 @@
+services:
+  rag-llm:
+    image: vllm/vllm-openai:latest
+    command:
+      - Qwen/Qwen2.5-7B-Instruct
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --gpu-memory-utilization
+      - "0.85"
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - hermes
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    ipc: host
+    gpus: all
+    restart: unless-stopped
+
+  redis-vector-db:
+    volumes:
+      - redis-data:/data
+
+  opea-openwebui-adapter:
+    build:
+      context: ../adapter
+      dockerfile: Dockerfile
+    image: local/opea-openwebui-adapter:1.0
+    environment:
+      OPEA_CHATQNA_URL: http://chaqna-backend-server:8888/v1/chatqna
+    ports:
+      - "127.0.0.1:8099:8000"
+    restart: unless-stopped
+
+  rag-open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    depends_on:
+      - opea-openwebui-adapter
+    ports:
+      - "3000:8080"
+    environment:
+      WEBUI_NAME: "Ninth Dimension AI"
+      DEFAULT_INTERFACE_SETTINGS: '{"widescreenMode":true,"chatBubble":true}'
+      OPENAI_API_BASE_URL: http://opea-openwebui-adapter:8000/v1
+      OPENAI_API_KEY: EMPTY
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?Set WEBUI_SECRET_KEY in .env}
+    volumes:
+      - open-webui-data:/app/backend/data
+    restart: unless-stopped
+
+  portal:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ../portal:/usr/share/nginx/html:ro
+    restart: unless-stopped
+
+  knowledge-manager:
+    build:
+      context: ../knowledge-ui
+    image: local/private-rag-knowledge-manager:1.0
+    environment:
+      DATAPREP_URL: http://dataprep-redis-service:5000
+      INDEX_NAME: rag-redis
+      SOURCES_DB_PATH: /data/knowledge_sources.db
+      SOURCE_ENCRYPTION_KEY: ${SOURCE_ENCRYPTION_KEY}
+      MAX_DB_ROWS: 5000
+      MAX_DB_EXPORT_MB: 20
+    volumes:
+      - /home/nduser/projects/private-ai-knowledge-platform/knowledge-ui-data:/data
+    ports:
+      - "8098:8000"
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
+  open-webui-data:
+  redis-data:
